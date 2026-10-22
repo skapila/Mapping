@@ -1,5 +1,8 @@
+import csv
+from pathlib import Path
+
 import numpy as np
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import LabelEncoder
@@ -8,9 +11,17 @@ import joblib
 # --- Load the X, y pair saved by Step 4 ---
 X = np.load("build_X.npy")
 y = np.load("build_y.npy")
+with open("build_paths.txt", encoding="utf-8") as f:
+    groups = np.array([line.rstrip("\r\n") for line in f])
 
 print(f"Loaded X: {X.shape}")
 print(f"Loaded y: {y.shape}")
+
+if len(X) != len(y) or len(X) != len(groups):
+    raise ValueError(
+        "build_X.npy, build_y.npy, and build_paths.txt must have the same "
+        f"number of rows; got {len(X)}, {len(y)}, and {len(groups)}."
+    )
 
 unique_labels, counts = np.unique(y, return_counts=True)
 print("\nClass distribution (full dataset):")
@@ -20,26 +31,23 @@ for label, count in zip(unique_labels, counts):
 encoder = LabelEncoder()
 y_encoded = encoder.fit_transform(y)
 
-# --- Build the SAME 5 folds as before, but only use ONE of them as the test set ---
-# We reuse StratifiedKFold (not train_test_split) specifically so this is
-# literally "fold 5" in the same sense as the 5-fold CV script -- same
-# random_state, same fold boundaries -- just using 1 split instead of
-# rotating through all 5.
+# --- Make a stratified split while keeping each source image in one fold ---
+# Each path appears once for the base image and again for its augmented views.
+# Grouping by path prevents versions of the same original image from appearing
+# in both training and test data.
 K_FOLDS = 5
-skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
+skf = StratifiedGroupKFold(n_splits=K_FOLDS, shuffle=True, random_state=42)
 
-# .split() is a generator that yields 5 (train_idx, test_idx) pairs, one per
-# fold. We only want the first one -- "fold 1" as the test set, folds 2-5
-# combined as training. (If you specifically want fold 5 as test instead,
-# see the note below the code.)
-all_splits = list(skf.split(X, y_encoded))
-train_idx, test_idx = all_splits[0]   # <-- index 0 = "fold 1" as test set
+# Use the first of the 5 stratified group folds as the held-out test set.
+train_idx, test_idx = next(skf.split(X, y_encoded, groups=groups))
 
 X_train, X_test = X[train_idx], X[test_idx]
 y_train, y_test = y_encoded[train_idx], y_encoded[test_idx]
 
-print(f"\nTrain set size: {len(train_idx)} images  (folds 2-5 combined)")
-print(f"Test set size:  {len(test_idx)} images  (fold 1 only)")
+print(f"\nTrain set size: {len(train_idx)} feature rows, "
+      f"{len(np.unique(groups[train_idx]))} source images")
+print(f"Test set size:  {len(test_idx)} feature rows, "
+      f"{len(np.unique(groups[test_idx]))} source images")
 
 print("\nClass distribution in TRAIN set:")
 train_labels, train_counts = np.unique(encoder.inverse_transform(y_train), return_counts=True)
@@ -59,6 +67,32 @@ clf.fit(X_train, y_train)
 y_pred = clf.predict(X_test)
 accuracy = (y_pred == y_test).mean()
 print(f"\nTest accuracy (on held-out fold): {accuracy:.3f}")
+
+report_path = Path("test_predictions.csv")
+with report_path.open("w", newline="", encoding="utf-8-sig") as report_file:
+    writer = csv.DictWriter(
+        report_file,
+        fieldnames=[
+            "feature_row",
+            "image_path",
+            "image_exists",
+            "true_label",
+            "predicted_label",
+            "correct",
+        ],
+    )
+    writer.writeheader()
+    for row_index, actual, predicted in zip(test_idx, y_test, y_pred):
+        image_path = Path(groups[row_index]).expanduser().resolve()
+        writer.writerow({
+            "feature_row": int(row_index),
+            "image_path": str(image_path),
+            "image_exists": image_path.is_file(),
+            "true_label": encoder.inverse_transform([actual])[0],
+            "predicted_label": encoder.inverse_transform([predicted])[0],
+            "correct": bool(actual == predicted),
+        })
+print(f"Saved held-out test predictions to {report_path.resolve()}")
 
 print("\nPer-class report (evaluated on the held-out fold only):")
 print(classification_report(y_test, y_pred, target_names=list(encoder.classes_), zero_division=0))
